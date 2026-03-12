@@ -54,6 +54,9 @@ Observed standalone frames:
 
 Both match the CRC-16/XMODEM model used elsewhere in the protocol.
 
+A strong working hypothesis is that TQF/C8 is the panel-originated event descriptor frame and contains the meaningful event context.
+TRB appears to be a generic confirmation or commit frame within the event transaction, rather than the frame that actually carries the button identity.
+This explains why TRB has almost no visible payload, why C8 can be observed from a standalone panel, and why TRB does not appear when the panel is powered without the main board.
 ## Goal of the project
 
 The long term goal is to create a small controller (for example using an ESP32) that can act as a virtual control panel and allow the ventilation unit to be controlled through software or home automation systems.
