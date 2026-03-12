@@ -29,6 +29,70 @@ The panel connects to the ventilation unit using a simple RS485 bus which also c
 
 ## Current progress
 
+## Major breakthrough update
+
+After extensive bus captures and testing using a logic analyzer and an ESP32-C3 connected through an isolated RS-485 interface, it has now been confirmed that the ECC05 protocol can be actively controlled by injecting valid frames onto the bus.
+
+The system accepts correctly formed `C8` event frames and processes them exactly like a real keypad button press. This means the control panel itself is not the authority of the system state. Instead, it sends event requests which the main ventilation controller interprets and then applies.
+
+This discovery means an external device can emulate a control panel and operate the ventilation unit directly.
+
+### What we discovered
+
+• The protocol uses **CRC-16 XMODEM** for frame integrity.  
+• Frames contain a **counter byte** which increments with events and state updates.  
+• The control panel sends **event requests**, not direct state changes.  
+• The **main controller** decides the final state and broadcasts it to all panels.  
+• External devices can inject valid frames and the controller accepts them normally.
+
+### Confirmed bus sequence
+
+The observed interaction sequence on the RS-485 bus appears to be:
+
+```
+Panel / external device → TQF (C8 event frame)
+Main controller        → TRB (event acknowledgement)
+Main controller        → TQF (0A state broadcast)
+Panel                  → TRC (state acknowledgement)
+```
+
+This confirms that the keypad buttons simply generate events, while the controller applies the change and informs all panels of the new state.
+
+### Status of protocol research
+
+Current confirmed items:
+
+• RS-485 bus speed: **38400 baud**  
+• Frame integrity: **CRC-16 XMODEM**  
+• Event request frame: **TQF / C8**  
+• Controller acknowledgement: **TRB**  
+• State broadcast frame: **TQF / 0A**  
+• Panel acknowledgement: **TRC**
+
+### Fan mode command
+
+Fan mode changes are performed through the `C8` event frame.
+
+The payload bytes indicate the requested action:
+
+```
+01 00 00  → normal fan mode change (next level)
+```
+
+Sending a correctly formed `C8` frame with this payload causes the controller to advance the fan speed. The controller then broadcasts the new system state to all panels.
+
+### Test results
+
+Using an ESP32-C3 connected through an isolated RS-485 module, repeated `C8` injections were performed.
+
+Results:
+
+• Fan mode successfully changed multiple times  
+• Panels updated LEDs correctly  
+• The controller broadcast the updated state after each event  
+• No errors or bus instability observed during repeated injections
+
+This confirms that external hardware can reliably emulate a control panel and control the ventilation system through the RS-485 protocol.
 The following parts of the protocol are already understood:
 
 • periodic state broadcast frames  
