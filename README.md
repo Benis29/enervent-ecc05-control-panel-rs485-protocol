@@ -1,4 +1,6 @@
-### W.I.P full •homeassistant mqtt• code coming soon
+### W.I.P 
+🤫full homeassistant mqtt code coming soon
+
 
 
 # Enervent ECC05 Control Panel RS485 Protocol
