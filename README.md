@@ -29,6 +29,7 @@ The panel connects to the ventilation unit using a simple RS485 bus which also c
 
 ## Current progress
 
+
 ## Major breakthrough update
 
 After extensive bus captures and testing using a logic analyzer and an ESP32-C3 connected through an isolated RS-485 interface, it has now been confirmed that the ECC05 protocol can be actively controlled by injecting valid frames onto the bus.
@@ -93,6 +94,22 @@ Results:
 • No errors or bus instability observed during repeated injections
 
 This confirms that external hardware can reliably emulate a control panel and control the ventilation system through the RS-485 protocol.
+
+### Confirmed control test
+
+Using an ESP32-C3 injector, valid `C8` frames were transmitted onto the bus.
+
+Result:
+
+• Controller accepted the injected event  
+• Fan mode advanced correctly  
+• Controller broadcast a new `0A` state frame  
+• All panels updated LEDs
+
+Repeated injections successfully cycled fan speed.
+
+
+
 The following parts of the protocol are already understood:
 
 • periodic state broadcast frames  
@@ -103,6 +120,23 @@ The following parts of the protocol are already understood:
 • CRC calculation
 
 Some parts still need more investigation, especially the extended features used by ECC05E panels that include heating control.
+
+
+### Test hardware
+
+The protocol was captured and tested using:
+
+• Saleae compatible 24MHz logic analyzer  
+• ESP32-C3 SuperMini  
+• XY-S485 isolated RS-485 interface module  
+• Logic 2 analyzer software
+
+The ESP32 was connected to the bus using:
+
+RX → GPIO20  
+TX → GPIO21  
+Baud → 38400 8N1
+
 
 ## Update 1
 Important observation:
