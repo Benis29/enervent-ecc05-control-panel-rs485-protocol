@@ -40,6 +40,20 @@ The following parts of the protocol are already understood:
 
 Some parts still need more investigation, especially the extended features used by ECC05E panels that include heating control.
 
+## Update 1
+Important observation:
+A spare ECC05 panel powered alone on the bench transmits valid TQF/C8 frames
+when a button is pressed, even with no main board connected.
+
+This strongly suggests that TQF/C8 is panel-originated and forms the start of
+the event-side protocol exchange.
+
+Observed standalone frames:
+54 51 46 0F 03 52 57 C8 01 00 00 05 BD
+54 51 46 0F 03 52 58 C8 02 00 00 39 14
+
+Both match the CRC-16/XMODEM model used elsewhere in the protocol.
+
 ## Goal of the project
 
 The long term goal is to create a small controller (for example using an ESP32) that can act as a virtual control panel and allow the ventilation unit to be controlled through software or home automation systems.
