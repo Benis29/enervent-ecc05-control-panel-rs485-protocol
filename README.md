@@ -1,3 +1,6 @@
+### W.I.P full •homeassistant mqtt• code coming soon
+
+
 # Enervent ECC05 Control Panel RS485 Protocol
 
 This project documents the RS485 communication protocol used between the Enervent ventilation unit main board and the ECC05 control panel.
