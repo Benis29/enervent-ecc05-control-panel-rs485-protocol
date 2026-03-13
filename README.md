@@ -1,186 +1,191 @@
-### W.I.P 
-🤫full homeassistant mqtt code coming soon
+# Enervent ECC05 RS485 Home Assistant Bridge
 
+This project provides a simple ESP32-based bridge that connects legacy Enervent ECC05 ventilation control systems to Home Assistant using MQTT.
 
+The bridge listens to the RS485 control bus used between the Enervent main controller and the ECC05 wall panels. It decodes state frames from the system and publishes them to MQTT, while also allowing Home Assistant to inject valid control events back onto the bus.
 
-# Enervent ECC05 Control Panel RS485 Protocol
+The goal of this project is to make older Enervent ventilation systems usable in modern smart home setups without modifying the original hardware.
 
-This project documents the RS485 communication protocol used between the Enervent ventilation unit main board and the ECC05 control panel.
+This implementation was developed by reverse engineering the proprietary RS485 protocol used by the ECC05 panels.
 
-The goal of this repository is to reverse engineer how the panel and the main unit communicate so that these older systems can be integrated with modern home automation systems or custom controllers.
+## Features
 
-This work was done using logic analyzer captures, UART sniffing and inspection of the ECC05 hardware.
+Current functionality includes:
 
-## What is documented here
+• Reading the fan speed level directly from the system
+• Changing fan speed using valid control events
+• Reading heat recovery (HR) state
+• Toggling heat recovery from Home Assistant
+• MQTT publishing of system state
+• MQTT command interface for control
+• Automatic WiFi and MQTT reconnection
+• Bus protection with command debounce to prevent event flooding
+• Serial debugging output for protocol analysis and troubleshooting
 
-• RS485 frame structure  
-• message types used on the bus (TQF, TRB, TRC)  
-• startup behaviour and boot handshake  
-• state polling and periodic broadcasts  
-• CRC behaviour and checksum experiments  
-• logic analyzer captures of real traffic  
-• hardware photos of the ECC05 PCB
+The system operates entirely passively on the RS485 bus and does not interfere with normal keypad operation.
 
-The captures show how the ventilation unit continuously broadcasts state information and how the panel responds to it. Button presses from the panel generate specific frames that trigger a new state broadcast from the main board.
+## Hardware Requirements
 
-## Hardware examined
+To build the bridge you need the following components.
 
-Control panel: Enervent ECC05  
-Microcontroller: Freescale MC908JL8  
-RS485 transceiver: SP485EEN  
-Bus: half-duplex RS485
+### ESP32 microcontroller
 
-The panel connects to the ventilation unit using a simple RS485 bus which also carries power for the panel.
+An ESP32 is required because the Enervent bus runs continuously and requires stable serial parsing while maintaining WiFi and MQTT connections.
 
-## Current progress
+Tested hardware:
 
-Current working interpretation of `TQF/0A` payload bytes:
+• ESP32-C3 SuperMini
+• ESP32-C3 SuperMini Plus
 
-- Byte 8: fan level (1–4)
-- Byte 9: after-heating level (0–4)
-- Byte 10: heat recovery state (0/1)
+Both versions work well. The Plus version simply includes a larger antenna.
 
-Confirmed:
-- Byte 8 changes with fan mode
-- Byte 10 changes with HR on/off
+### RS485 interface module
 
-Strongly likely:
-- Byte 9 represents after-heating level on systems that support it
+An isolated RS485 interface is strongly recommended to protect the ESP32 and your HVAC system.
 
-## Major breakthrough update
+Recommended module:
 
-After extensive bus captures and testing using a logic analyzer and an ESP32-C3 connected through an isolated RS-485 interface, it has now been confirmed that the ECC05 protocol can be actively controlled by injecting valid frames onto the bus.
+• **XY-S485 isolated RS485 to TTL module**
 
-The system accepts correctly formed `C8` event frames and processes them exactly like a real keypad button press. This means the control panel itself is not the authority of the system state. Instead, it sends event requests which the main ventilation controller interprets and then applies.
+The module automatically handles transmit direction switching which simplifies firmware.
 
-This discovery means an external device can emulate a control panel and operate the ventilation unit directly.
+### Wiring
 
-### What we discovered
-
-• The protocol uses **CRC-16 XMODEM** for frame integrity.  
-• Frames contain a **counter byte** which increments with events and state updates.  
-• The control panel sends **event requests**, not direct state changes.  
-• The **main controller** decides the final state and broadcasts it to all panels.  
-• External devices can inject valid frames and the controller accepts them normally.
-
-### Confirmed bus sequence
-
-The observed interaction sequence on the RS-485 bus appears to be:
+Panel connector cable
 
 ```
-Panel / external device → TQF (C8 event frame)
-Main controller        → TRB (event acknowledgement)
-Main controller        → TQF (0A state broadcast)
-Panel                  → TRC (state acknowledgement)
+You need an rj9 (4P4C) cable for connecting to the bus
 ```
 
-This confirms that the keypad buttons simply generate events, while the controller applies the change and informs all panels of the new state.
-
-### Status of protocol research
-
-Current confirmed items:
-
-• RS-485 bus speed: **38400 baud**  
-• Frame integrity: **CRC-16 XMODEM**  
-• Event request frame: **TQF / C8**  
-• Controller acknowledgement: **TRB**  
-• State broadcast frame: **TQF / 0A**  
-• Panel acknowledgement: **TRC**
-
-### Fan mode command
-
-Fan mode changes are performed through the `C8` event frame.
-
-The payload bytes indicate the requested action:
+The connection between the ESP32 and the RS485 module is simple.
 
 ```
-01 00 00  → normal fan mode change (next level)
+ESP32 GPIO20 → RX (module RXD)
+ESP32 GPIO21 → TX (module TXD)
+ESP32 GND → GND
+ESP32 3.3V → VCC
 ```
 
-Sending a correctly formed `C8` frame with this payload causes the controller to advance the fan speed. The controller then broadcasts the new system state to all panels.
+The RS485 side of the module connects directly to the Enervent control bus.
 
-### Test results
+```
+RS485 A → Enervent bus A
+RS485 B → Enervent bus B
+```
 
-Using an ESP32-C3 connected through an isolated RS-485 module, repeated `C8` injections were performed.
+The Enervent control bus runs at **38400 baud, 8N1**.
 
-Results:
+## Firmware
 
-• Fan mode successfully changed multiple times  
-• Panels updated LEDs correctly  
-• The controller broadcast the updated state after each event  
-• No errors or bus instability observed during repeated injections
+The firmware performs three main tasks:
 
-This confirms that external hardware can reliably emulate a control panel and control the ventilation system through the RS-485 protocol.
+1. Listening to the RS485 bus and parsing frames
+2. Publishing decoded state information to MQTT
+3. Injecting valid control events when MQTT commands are received
 
-### Confirmed control test
+Important frame types identified during reverse engineering:
 
-Using an ESP32-C3 injector, valid `C8` frames were transmitted onto the bus.
+TQF 0A
+System state broadcast frame
 
-Result:
+TQF C8
+Control event frame
 
-• Controller accepted the injected event  
-• Fan mode advanced correctly  
-• Controller broadcast a new `0A` state frame  
-• All panels updated LEDs
+TRB
+Event acknowledgement
 
-Repeated injections successfully cycled fan speed.
+TRC
+State acknowledgement
 
+CRC validation uses **CRC-16 XMODEM**.
 
+## MQTT Topics
 
-The following parts of the protocol are already understood:
+The firmware exposes the following MQTT interface.
 
-• periodic state broadcast frames  
-• acknowledgement frames from the panel  
-• button press event frames  
-• basic address structure  
-• frame counters  
-• CRC calculation
+### State topics
 
-Some parts still need more investigation, especially the extended features used by ECC05E panels that include heating control.
+```
+enervent/fan_level/state
+enervent/hr/state
+enervent/availability
+```
 
+### Command topics
 
-### Test hardware
+```
+enervent/fan_next/set
+enervent/hr_toggle/set
+```
 
-The protocol was captured and tested using:
+### Debug topic
 
-• Saleae compatible 24MHz logic analyzer  
-• ESP32-C3 SuperMini  
-• XY-S485 isolated RS-485 interface module  
-• Logic 2 analyzer software
+```
+enervent/debug
+```
 
-The ESP32 was connected to the bus using:
+Debug messages and protocol information are published here when MQTT is connected.
 
-RX → GPIO20  
-TX → GPIO21  
-Baud → 38400 8N1
+## Home Assistant Integration
 
+Home Assistant can interact with the system through standard MQTT entities.
 
-## Update 1
-Important observation:
-A spare ECC05 panel powered alone on the bench transmits valid TQF/C8 frames
-when a button is pressed, even with no main board connected.
+Example entity types:
 
-This strongly suggests that TQF/C8 is panel-originated and forms the start of
-the event-side protocol exchange.
+• Fan level sensor
+• Fan speed button
+• HR state binary sensor
+• HR toggle button
 
-Observed standalone frames:
-54 51 46 0F 03 52 57 C8 01 00 00 05 BD
-54 51 46 0F 03 52 58 C8 02 00 00 39 14
+Automations can then be used to implement scheduling or smart control behavior.
 
-Both match the CRC-16/XMODEM model used elsewhere in the protocol.
+## Serial Debugging
 
-A strong working hypothesis is that TQF/C8 is the panel-originated event descriptor frame and contains the meaningful event context.
-TRB appears to be a generic confirmation or commit frame within the event transaction, rather than the frame that actually carries the button identity.
-This explains why TRB has almost no visible payload, why C8 can be observed from a standalone panel, and why TRB does not appear when the panel is powered without the main board.
-## Goal of the project
+The firmware outputs useful debugging information to the serial port.
 
-The long term goal is to create a small controller (for example using an ESP32) that can act as a virtual control panel and allow the ventilation unit to be controlled through software or home automation systems.
+Serial monitor settings:
 
-## Disclaimer
+```
+Baud rate: 115200
+```
 
-This project is not affiliated with Enervent.
+Debug output includes:
 
-All information is based on reverse engineering of hardware and bus captures.  
-Use the information here at your own risk. Working with HVAC systems and electronics can damage equipment if done incorrectly.
+• detected frame types
+• counters from bus events
+• injected commands
+• connection status
 
-This repository exists for educational and hobbyist purposes.
+This is very helpful when analyzing the protocol or diagnosing bus issues.
+
+## Safety Notes
+
+This project interacts with the control bus of a ventilation system. While the RS485 interface is electrically isolated, incorrect wiring or experimental firmware could potentially disrupt system operation.
+
+Use this project at your own risk.
+
+The author is not responsible for damage to HVAC equipment or property.
+
+## Project Status
+
+The following features are confirmed working:
+
+• Fan state reading
+• Fan speed control
+• HR state detection
+• HR toggle control
+• MQTT integration
+• Home Assistant automation control
+
+Future work may include:
+
+• additional sensor decoding
+• after-heating control
+• full protocol documentation
+• native Home Assistant fan entity support
+
+## Acknowledgements
+
+This project exists thanks to extensive protocol analysis of the Enervent ECC05 control bus using logic analyzer captures and real system testing.
+
+Older ventilation systems should not become obsolete simply because their control interfaces are proprietary.
