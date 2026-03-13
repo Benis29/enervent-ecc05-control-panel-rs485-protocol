@@ -1,0 +1,572 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+/*
+Enervent ECC05 RS485 -> MQTT bridge
+-----------------------------------
+
+What this does:
+- Connects an ESP32-C3 to the Enervent ECC05 RS485 control bus
+- Parses known frame types:
+* TQF/C8 = event frame
+* TQF/0A = state frame
+* TRB = event acknowledgement
+* TRC = state acknowledgement
+- Publishes fan level and HR state to MQTT
+- Subscribes to MQTT topics for:
+* fan next
+* HR toggle
+- Injects valid C8 event frames onto the bus
+
+Hardware:
+- ESP32-C3 SuperMini
+- XYS485 auto-direction RS485 module
+- RX = GPIO20
+- TX = GPIO21
+
+Serial monitor:
+- Baud: 115200
+- Used for debug prints and troubleshooting
+
+Required Arduino library:
+- PubSubClient by Nick O'Leary
+
+Notes:
+- Fan command is confirmed working
+- HR read/write was decoded from captures and integrated here
+- HR support should still be treated as newly integrated until tested in this exact build
+*/
+
+// =========================
+// Wi-Fi settings
+// =========================
+static const char* WIFI_SSID = "YOUR_WIFI_NAME_HERE";
+static const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD_HERE";
+
+// =========================
+// MQTT settings
+// =========================
+static const char* MQTT_HOST = "YOUR_MQTT_BROKER_IP_OR_HOSTNAME";
+static const uint16_t MQTT_PORT = 1883;
+static const char* MQTT_USER = "YOUR_MQTT_USERNAME_HERE";
+static const char* MQTT_PASSWORD = "YOUR_MQTT_PASSWORD_HERE";
+
+// Prefix used for all MQTT topics
+static const char* MQTT_PREFIX = "enervent";
+
+// =========================
+// ESP32-C3 UART settings
+// =========================
+static const int BUS_RX_PIN = 20; // ESP RX <- XYS485 TXD
+static const int BUS_TX_PIN = 21; // ESP TX -> XYS485 RXD
+static const uint32_t BUS_BAUD = 38400;
+
+// =========================
+// Retry / timing settings
+// =========================
+static const uint32_t WIFI_RETRY_MS = 10000;
+static const uint32_t MQTT_RETRY_MS = 10000;
+static const uint32_t STATUS_PRINT_MS = 3600000UL; // 1 hour
+static const uint32_t IGNORE_RX_AFTER_TX_MS = 120;
+
+// Prevent command spam on the bus
+static const uint32_t COMMAND_DEBOUNCE_MS = 1000;
+
+// =========================
+// Globals
+// =========================
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+HardwareSerial BusSerial(1);
+
+uint8_t rxBuf[256];
+size_t rxLen = 0;
+
+uint32_t lastWifiRetryMs = 0;
+uint32_t lastMqttRetryMs = 0;
+uint32_t lastStatusPrintMs = 0;
+uint32_t ignoreRxUntilMs = 0;
+uint32_t lastCommandMs = 0;
+
+// Last known fan level from real 0A frames
+bool haveFanLevel = false;
+uint8_t currentFanLevel = 0;
+
+// Last known HR state from real 0A frames
+bool haveHrState = false;
+bool currentHrOn = false;
+
+// Last seen real C8 event frame
+// Needed so we can inject the next valid event counter
+bool haveLastRealC8 = false;
+uint8_t lastRealC8Counter = 0;
+uint8_t lastRealC8Addr[3] = {0x0F, 0x02, 0x52};
+
+// MQTT topic buffers
+char topicAvailability[96];
+char topicFanState[96];
+char topicFanNextSet[96];
+char topicHrState[96];
+char topicHrToggleSet[96];
+char topicDebug[96];
+
+// =========================
+// CRC-16/XMODEM
+// =========================
+uint16_t crc16_xmodem(const uint8_t* data, size_t len) {
+uint16_t crc = 0x0000;
+
+for (size_t i = 0; i < len; i++) {
+crc ^= ((uint16_t)data[i] << 8);
+
+for (int j = 0; j < 8; j++) {
+if (crc & 0x8000) {
+crc = (uint16_t)((crc << 1) ^ 0x1021);
+} else {
+crc <<= 1;
+}
+}
+}
+
+return crc;
+}
+
+bool frameCrcValid(const uint8_t* frame, size_t len) {
+if (len < 4) return false;
+
+// CRC is stored big-endian in the last 2 bytes
+uint16_t expected = ((uint16_t)frame[len - 2] << 8) | frame[len - 1];
+
+// Protocol CRC is calculated over frame[1:-2]
+uint16_t actual = crc16_xmodem(&frame[1], len - 3);
+
+return expected == actual;
+}
+
+void setFrameCrc(uint8_t* frame, size_t len) {
+uint16_t crc = crc16_xmodem(&frame[1], len - 3);
+frame[len - 2] = (uint8_t)(crc >> 8);
+frame[len - 1] = (uint8_t)(crc & 0xFF);
+}
+
+// =========================
+// Helpers
+// =========================
+void publishDebug(const String& msg) {
+Serial.println(msg);
+
+if (mqttClient.connected()) {
+mqttClient.publish(topicDebug, msg.c_str(), false);
+}
+}
+
+void publishFanLevel(uint8_t fan) {
+char payload[4];
+snprintf(payload, sizeof(payload), "%u", fan);
+mqttClient.publish(topicFanState, payload, true);
+}
+
+void publishHrState(bool hrOn) {
+mqttClient.publish(topicHrState, hrOn ? "ON" : "OFF", true);
+}
+
+// =========================
+// Frame type checks
+// =========================
+bool isTQFC8(const uint8_t* f, size_t len) {
+return len == 13 &&
+f[0] == 0x54 && f[1] == 0x51 && f[2] == 0x46 &&
+f[7] == 0xC8 &&
+frameCrcValid(f, len);
+}
+
+bool isTQF0A(const uint8_t* f, size_t len) {
+return len == 13 &&
+f[0] == 0x54 && f[1] == 0x51 && f[2] == 0x46 &&
+f[7] == 0x0A &&
+frameCrcValid(f, len);
+}
+
+bool isTRC(const uint8_t* f, size_t len) {
+return len == 10 &&
+f[0] == 0x54 && f[1] == 0x52 && f[2] == 0x43 &&
+f[7] == 0x0A &&
+frameCrcValid(f, len);
+}
+
+bool isTRB(const uint8_t* f, size_t len) {
+return len == 9 &&
+f[0] == 0x54 && f[1] == 0x52 && f[2] == 0x42 &&
+frameCrcValid(f, len);
+}
+
+// =========================
+// Bus frame handler
+// =========================
+void handleFrame(const uint8_t* f, size_t len) {
+if (isTQFC8(f, len)) {
+// Save the last real C8 so our next injection uses the next expected event counter
+haveLastRealC8 = true;
+lastRealC8Counter = f[6];
+lastRealC8Addr[0] = f[3];
+lastRealC8Addr[1] = f[4];
+lastRealC8Addr[2] = f[5];
+
+String msg = "C8 seen counter=0x";
+if (lastRealC8Counter < 0x10) msg += "0";
+msg += String(lastRealC8Counter, HEX);
+publishDebug(msg);
+return;
+}
+
+if (isTQF0A(f, len)) {
+// State payload layout:
+// byte 8 = fan level
+// byte 9 = after-heating level (likely)
+// byte 10 = HR state
+const uint8_t fan = f[8];
+const bool hrOn = (f[10] != 0x00);
+
+if (!haveFanLevel || fan != currentFanLevel) {
+currentFanLevel = fan;
+haveFanLevel = true;
+
+String msg = "0A seen fan=" + String(fan) + " counter=0x";
+if (f[6] < 0x10) msg += "0";
+msg += String(f[6], HEX);
+publishDebug(msg);
+
+if (mqttClient.connected()) {
+publishFanLevel(currentFanLevel);
+}
+}
+
+if (!haveHrState || hrOn != currentHrOn) {
+currentHrOn = hrOn;
+haveHrState = true;
+
+String msg = "0A seen HR=";
+msg += hrOn ? "ON" : "OFF";
+publishDebug(msg);
+
+if (mqttClient.connected()) {
+publishHrState(currentHrOn);
+}
+}
+return;
+}
+
+if (isTRB(f, len)) {
+String msg = "TRB seen counter=0x";
+if (f[6] < 0x10) msg += "0";
+msg += String(f[6], HEX);
+publishDebug(msg);
+return;
+}
+
+if (isTRC(f, len)) {
+String msg = "TRC seen counter=0x";
+if (f[6] < 0x10) msg += "0";
+msg += String(f[6], HEX);
+publishDebug(msg);
+return;
+}
+}
+
+// =========================
+// Rolling stream parser
+// =========================
+// Scans the byte stream for valid known frames.
+// Does not rely on timing gaps between frames.
+void processRxBuffer() {
+while (rxLen >= 3) {
+size_t start = 0;
+while (start < rxLen && rxBuf[start] != 0x54) {
+start++;
+}
+
+if (start > 0) {
+memmove(rxBuf, rxBuf + start, rxLen - start);
+rxLen -= start;
+if (rxLen < 3) return;
+}
+
+if (rxLen < 3) return;
+
+const uint8_t h1 = rxBuf[0];
+const uint8_t h2 = rxBuf[1];
+const uint8_t h3 = rxBuf[2];
+
+if (h1 == 0x54 && h2 == 0x51 && h3 == 0x46) {
+// TQF family
+if (rxLen < 8) return;
+if (rxLen < 13) return;
+
+if (isTQFC8(rxBuf, 13) || isTQF0A(rxBuf, 13)) {
+handleFrame(rxBuf, 13);
+memmove(rxBuf, rxBuf + 13, rxLen - 13);
+rxLen -= 13;
+continue;
+}
+
+memmove(rxBuf, rxBuf + 1, rxLen - 1);
+rxLen -= 1;
+continue;
+}
+
+if (h1 == 0x54 && h2 == 0x52 && h3 == 0x43) {
+// TRC
+if (rxLen < 10) return;
+
+if (isTRC(rxBuf, 10)) {
+handleFrame(rxBuf, 10);
+memmove(rxBuf, rxBuf + 10, rxLen - 10);
+rxLen -= 10;
+continue;
+}
+
+memmove(rxBuf, rxBuf + 1, rxLen - 1);
+rxLen -= 1;
+continue;
+}
+
+if (h1 == 0x54 && h2 == 0x52 && h3 == 0x42) {
+// TRB
+if (rxLen < 9) return;
+
+if (isTRB(rxBuf, 9)) {
+handleFrame(rxBuf, 9);
+memmove(rxBuf, rxBuf + 9, rxLen - 9);
+rxLen -= 9;
+continue;
+}
+
+memmove(rxBuf, rxBuf + 1, rxLen - 1);
+rxLen -= 1;
+continue;
+}
+
+// Unknown header, shift one byte and try again
+memmove(rxBuf, rxBuf + 1, rxLen - 1);
+rxLen -= 1;
+}
+}
+
+// =========================
+// Event injection
+// =========================
+bool injectC8Payload(uint8_t b8, uint8_t b9, uint8_t b10, const char* label) {
+const uint32_t now = millis();
+
+// Debounce protection so MQTT spam or button spam cannot hammer the bus
+if (now - lastCommandMs < COMMAND_DEBOUNCE_MS) {
+publishDebug(String("Command blocked by debounce: ") + label);
+return false;
+}
+
+if (!haveLastRealC8) {
+publishDebug(String("Cannot inject ") + label + ": no real C8 seen yet");
+return false;
+}
+
+lastCommandMs = now;
+
+uint8_t frame[13] = {
+0x54, 0x51, 0x46, // TQF
+lastRealC8Addr[0],
+lastRealC8Addr[1],
+lastRealC8Addr[2],
+(uint8_t)(lastRealC8Counter + 1),
+0xC8,
+b8, b9, b10,
+0x00, 0x00
+};
+
+setFrameCrc(frame, sizeof(frame));
+
+String msg = String("Injecting ") + label + " C8 counter=0x";
+if (frame[6] < 0x10) msg += "0";
+msg += String(frame[6], HEX);
+publishDebug(msg);
+
+BusSerial.write(frame, sizeof(frame));
+BusSerial.flush();
+
+// Ignore brief self-echo after TX
+ignoreRxUntilMs = millis() + IGNORE_RX_AFTER_TX_MS;
+
+// Advance local event counter model
+lastRealC8Counter = frame[6];
+haveLastRealC8 = true;
+
+return true;
+}
+
+bool injectFanNext() {
+// Confirmed working payload for fan-next
+return injectC8Payload(0x01, 0x00, 0x00, "fan_next");
+}
+
+bool injectHrToggle() {
+// Decoded from captures:
+// HR event = C8 00 00 01
+return injectC8Payload(0x00, 0x00, 0x01, "hr_toggle");
+}
+
+// =========================
+// Wi-Fi / MQTT
+// =========================
+void ensureWiFi() {
+if (WiFi.status() == WL_CONNECTED) return;
+
+const uint32_t now = millis();
+if (now - lastWifiRetryMs < WIFI_RETRY_MS) return;
+lastWifiRetryMs = now;
+
+Serial.println("Connecting Wi-Fi...");
+WiFi.disconnect(true, true);
+delay(100);
+WiFi.mode(WIFI_STA);
+WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+const String t = String(topic);
+String msg;
+msg.reserve(length);
+
+for (unsigned int i = 0; i < length; i++) {
+msg += (char)payload[i];
+}
+msg.trim();
+
+if (t == topicFanNextSet) {
+if (msg == "1" || msg == "ON" || msg == "on" || msg == "PRESS" || msg == "press") {
+if (!injectFanNext()) {
+publishDebug("fan_next command ignored");
+}
+}
+return;
+}
+
+if (t == topicHrToggleSet) {
+if (msg == "1" || msg == "ON" || msg == "on" || msg == "PRESS" || msg == "press" || msg == "TOGGLE" || msg == "toggle") {
+if (!injectHrToggle()) {
+publishDebug("hr_toggle command ignored");
+}
+}
+return;
+}
+}
+
+void ensureMqtt() {
+if (WiFi.status() != WL_CONNECTED) return;
+if (mqttClient.connected()) return;
+
+const uint32_t now = millis();
+if (now - lastMqttRetryMs < MQTT_RETRY_MS) return;
+lastMqttRetryMs = now;
+
+Serial.println("Connecting MQTT...");
+
+const char* clientId = "enervent-c3-bridge";
+
+bool ok = mqttClient.connect(
+clientId,
+MQTT_USER,
+MQTT_PASSWORD,
+topicAvailability,
+1,
+true,
+"offline"
+);
+
+if (ok) {
+mqttClient.publish(topicAvailability, "online", true);
+mqttClient.subscribe(topicFanNextSet);
+mqttClient.subscribe(topicHrToggleSet);
+
+publishDebug("MQTT connected");
+
+if (haveFanLevel) {
+publishFanLevel(currentFanLevel);
+}
+if (haveHrState) {
+publishHrState(currentHrOn);
+}
+} else {
+Serial.print("MQTT connect failed, rc=");
+Serial.println(mqttClient.state());
+}
+}
+
+// =========================
+// Setup / loop
+// =========================
+void setupTopics() {
+snprintf(topicAvailability, sizeof(topicAvailability), "%s/availability", MQTT_PREFIX);
+snprintf(topicFanState, sizeof(topicFanState), "%s/fan_level/state", MQTT_PREFIX);
+snprintf(topicFanNextSet, sizeof(topicFanNextSet), "%s/fan_next/set", MQTT_PREFIX);
+snprintf(topicHrState, sizeof(topicHrState), "%s/hr/state", MQTT_PREFIX);
+snprintf(topicHrToggleSet, sizeof(topicHrToggleSet), "%s/hr_toggle/set", MQTT_PREFIX);
+snprintf(topicDebug, sizeof(topicDebug), "%s/debug", MQTT_PREFIX);
+}
+
+void setup() {
+Serial.begin(115200);
+delay(500);
+Serial.println();
+Serial.println("Enervent MQTT bridge starting");
+
+setupTopics();
+
+BusSerial.begin(BUS_BAUD, SERIAL_8N1, BUS_RX_PIN, BUS_TX_PIN);
+
+mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+mqttClient.setCallback(mqttCallback);
+
+WiFi.mode(WIFI_STA);
+}
+
+void loop() {
+ensureWiFi();
+ensureMqtt();
+
+if (mqttClient.connected()) {
+mqttClient.loop();
+}
+
+while (BusSerial.available() > 0) {
+uint8_t b = (uint8_t)BusSerial.read();
+
+if (millis() < ignoreRxUntilMs) {
+continue;
+}
+
+if (rxLen < sizeof(rxBuf)) {
+rxBuf[rxLen++] = b;
+} else {
+// If buffer fills up, drop oldest byte
+memmove(rxBuf, rxBuf + 1, rxLen - 1);
+rxBuf[rxLen - 1] = b;
+}
+}
+
+processRxBuffer();
+
+const uint32_t now = millis();
+if (now - lastStatusPrintMs >= STATUS_PRINT_MS) {
+lastStatusPrintMs = now;
+
+String msg = "Hourly status: WiFi=";
+msg += (WiFi.status() == WL_CONNECTED) ? "up" : "down";
+msg += " MQTT=";
+msg += mqttClient.connected() ? "up" : "down";
+msg += " fan=";
+msg += haveFanLevel ? String(currentFanLevel) : String("unknown");
+msg += " HR=";
+msg += haveHrState ? String(currentHrOn ? "ON" : "OFF") : String("unknown");
+publishDebug(msg);
+}
+}
