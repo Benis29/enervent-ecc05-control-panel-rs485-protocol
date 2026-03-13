@@ -34,6 +34,18 @@ The panel connects to the ventilation unit using a simple RS485 bus which also c
 
 ## Current progress
 
+Current working interpretation of `TQF/0A` payload bytes:
+
+- Byte 8: fan level (1–4)
+- Byte 9: after-heating level (0–4)
+- Byte 10: heat recovery state (0/1)
+
+Confirmed:
+- Byte 8 changes with fan mode
+- Byte 10 changes with HR on/off
+
+Strongly likely:
+- Byte 9 represents after-heating level on systems that support it
 
 ## Major breakthrough update
 
